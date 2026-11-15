@@ -54,6 +54,8 @@ jobs:
         env:
           SAGE_CONTRACTS_DIR: ${{ github.workspace }}/sage-contracts
         run: scripts/local-chain.sh 8545
+      - name: Run binding scenarios
+        run: go run ./cmd/binding-scenarios
       - name: Run settlement scenarios
         run: go run ./cmd/settle-scenarios
       - name: Keep the trace

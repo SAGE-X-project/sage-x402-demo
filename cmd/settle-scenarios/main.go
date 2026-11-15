@@ -28,6 +28,7 @@ import (
 	x402types "github.com/x402-foundation/x402/go/v2/types"
 
 	"github.com/sage-x-project/sage-x402-demo/internal/chain"
+	"github.com/sage-x-project/sage-x402-demo/internal/delegation"
 	"github.com/sage-x-project/sage-x402-demo/internal/payer"
 	"github.com/sage-x-project/sage-x402-demo/internal/trace"
 )
@@ -56,7 +57,10 @@ type deployment struct {
 		AgentPayKey  string `json:"agent_payment_key"`
 	} `json:"accounts"`
 	ModelB struct {
-		Account string `json:"delegated_account"`
+		Account string   `json:"delegated_account"`
+		Cap     string   `json:"per_payment_cap"`
+		Budget  string   `json:"budget"`
+		PayTo   []string `json:"pay_to"`
 	} `json:"model_b"`
 }
 
@@ -124,6 +128,10 @@ func run(deploymentPath, tracePath string) error {
 	r.swapPayTo("A3 model A payTo swapped after signing", modelA, merchant, other, "eip3009")
 
 	// Model B: Permit2 from the user's delegated account, signed by the agent payment key.
+	// Apply the deployment's terms first: another program may have changed them.
+	if err := r.delegateFromDeployment(); err != nil {
+		return err
+	}
 	r.pay("B1 model B pays 4 DUSD", modelB, r.requirements("4000000", merchant, "permit2"), "")
 	r.pay("B2 model B over the per-payment cap", modelB, r.requirements("11000000", merchant, "permit2"), "acl")
 	r.pay("B3 model B recipient outside the ACL", modelB, r.requirements("1000000", other, "permit2"), "acl")
@@ -270,6 +278,16 @@ func (r *runner) swapPayTo(name string, signer evm.ClientEvmSigner, signedFor, p
 	swapped.PayTo = presented
 	payload.Accepted = swapped
 	r.record(name, "invalid", r.settle(name, payload, swapped))
+}
+
+func (r *runner) delegateFromDeployment() error {
+	capAmount, ok1 := new(big.Int).SetString(r.d.ModelB.Cap, 10)
+	budget, ok2 := new(big.Int).SetString(r.d.ModelB.Budget, 10)
+	if !ok1 || !ok2 {
+		return errors.New("deployment: model_b cap or budget")
+	}
+	return delegation.Apply(r.ctx, r.d.RPC, userKey, r.d.ModelB.Account, delegation.Terms{Key: r.d.Accounts.AgentPayKey, DID: r.d.DID,
+		Token: r.d.Token.Address, Cap: capAmount, Budget: budget, TTL: 86400, PayTos: r.d.ModelB.PayTo})
 }
 
 func (r *runner) revokeDelegation() error {
