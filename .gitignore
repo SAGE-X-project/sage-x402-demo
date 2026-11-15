@@ -1,0 +1,10 @@
+# Foundry
+out/
+cache/
+broadcast/
+# Go
+/bin/
+# Local run output
+/run/
+*.log
+.env
