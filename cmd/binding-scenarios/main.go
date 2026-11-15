@@ -26,7 +26,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/abi"
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/sage-x-project/sage/pkg/agent/registry011"
 	"github.com/sage-x-project/sage/pkg/agent/wire011"
@@ -36,6 +35,7 @@ import (
 
 	"github.com/sage-x-project/sage-x402-demo/internal/binding"
 	"github.com/sage-x-project/sage-x402-demo/internal/chain"
+	"github.com/sage-x-project/sage-x402-demo/internal/delegation"
 	"github.com/sage-x-project/sage-x402-demo/internal/devtls"
 	"github.com/sage-x-project/sage-x402-demo/internal/payer"
 	"github.com/sage-x-project/sage-x402-demo/internal/trace"
@@ -193,7 +193,7 @@ func run(deploymentPath, tracePath string) ([]result, error) {
 	bindAccount := func(statement []byte) ([]byte, error) { return crypto.Sign(accountsTextHash(statement), accountKey) }
 	// The user delegates afresh so this run does not depend on earlier runs:
 	// 10 DUSD per payment, 50 DUSD in total, to the merchant only.
-	if err := userDelegates(ctx, signer, d, delegated.KeyAddress().Hex(), agentID.DID); err != nil {
+	if err := userDelegates(ctx, d, delegated.KeyAddress().Hex(), agentID.DID); err != nil {
 		return nil, fmt.Errorf("delegate: %w", err)
 	}
 	agentB := &binding.Agent{Client: newClient(agentID), Payer: delegated}
@@ -364,43 +364,9 @@ func accountsTextHash(message []byte) []byte { return accounts.TextHash(message)
 
 func bigZero() *big.Int { return new(big.Int) }
 
-var accountABI = mustABI(`[{"type":"function","name":"delegate","inputs":[{"name":"key","type":"address"},{"name":"did","type":"string"},
-	{"name":"token","type":"address"},{"name":"cap","type":"uint256"},{"name":"expires","type":"uint64"},{"name":"payTos","type":"address[]"}],"outputs":[]},
-	{"type":"function","name":"setBudget","inputs":[{"name":"token","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[]}]`)
-
-func userDelegates(ctx context.Context, signer *chain.FacilitatorSigner, d deployment, key, did string) error {
-	user, err := chain.NewFacilitatorSigner(ctx, d.RPC, userKey, 31337)
-	if err != nil {
-		return err
-	}
-	defer user.Close()
-	head, err := user.Client().HeaderByNumber(ctx, nil)
-	if err != nil {
-		return err
-	}
-	calls := []struct {
-		method string
-		args   []any
-	}{
-		{"delegate", []any{common.HexToAddress(key), did, common.HexToAddress(d.Token.Address), big.NewInt(10_000_000),
-			head.Time + 86400, []common.Address{common.HexToAddress(d.Accounts.Merchant)}}},
-		{"setBudget", []any{common.HexToAddress(d.Token.Address), big.NewInt(50_000_000)}},
-	}
-	for _, c := range calls {
-		data, err := accountABI.Pack(c.method, c.args...)
-		if err != nil {
-			return err
-		}
-		tx, err := user.SendTransaction(ctx, d.ModelB.Account, data)
-		if err != nil {
-			return err
-		}
-		receipt, err := user.WaitForTransactionReceipt(ctx, tx)
-		if err != nil || receipt.Status != 1 {
-			return fmt.Errorf("%s failed: %v", c.method, err)
-		}
-	}
-	return nil
+func userDelegates(ctx context.Context, d deployment, key, did string) error {
+	return delegation.Apply(ctx, d.RPC, userKey, d.ModelB.Account, delegation.Terms{Key: key, DID: did, Token: d.Token.Address,
+		Cap: big.NewInt(10_000_000), Budget: big.NewInt(50_000_000), TTL: 86400, PayTos: []string{d.Accounts.Merchant}})
 }
 
 func mustABI(text string) abi.ABI {
