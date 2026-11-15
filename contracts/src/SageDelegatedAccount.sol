@@ -11,7 +11,8 @@ interface IPermit2Domain {
 }
 
 /// @notice A user-owned account that lets SAGE agents pay through the x402
-/// exact Permit2 path without holding the user's funds. The owner names each
+/// exact Permit2 path (x402 go/v2.29.0 witness: to, validAfter) without
+/// holding the user's funds. The owner names each
 /// agent payment key, the agent DID it belongs to, one token, a per-payment
 /// cap, an expiry and the recipients it may pay. The total budget is the
 /// ERC-20 allowance this account gives Permit2, so the chain enforces it on
@@ -47,7 +48,6 @@ contract SageDelegatedAccount is IERC1271 {
         uint256 deadline;
         address to;
         uint256 validAfter;
-        bytes extra;
     }
 
     bytes4 private constant MAGIC = IERC1271.isValidSignature.selector;
@@ -58,10 +58,10 @@ contract SageDelegatedAccount is IERC1271 {
     bytes32 private constant AUTHORIZATION_TYPEHASH =
         keccak256("SagePaymentAuthorization(bytes32 permit2Digest,uint64 epoch)");
     bytes32 private constant TOKEN_PERMISSIONS_TYPEHASH = keccak256("TokenPermissions(address token,uint256 amount)");
-    bytes32 private constant WITNESS_TYPEHASH = keccak256("Witness(address to,uint256 validAfter,bytes extra)");
+    bytes32 private constant WITNESS_TYPEHASH = keccak256("Witness(address to,uint256 validAfter)");
     bytes32 private constant PERMIT_WITNESS_TYPEHASH = keccak256(
         "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,Witness witness)"
-        "TokenPermissions(address token,uint256 amount)Witness(address to,uint256 validAfter,bytes extra)"
+        "TokenPermissions(address token,uint256 amount)Witness(address to,uint256 validAfter)"
     );
 
     address public immutable owner;
@@ -209,7 +209,7 @@ contract SageDelegatedAccount is IERC1271 {
 
     function _digest(PaymentAuthorization memory p) private view returns (bytes32) {
         bytes32 permitted = keccak256(abi.encode(TOKEN_PERMISSIONS_TYPEHASH, p.token, p.amount));
-        bytes32 witness = keccak256(abi.encode(WITNESS_TYPEHASH, p.to, p.validAfter, keccak256(p.extra)));
+        bytes32 witness = keccak256(abi.encode(WITNESS_TYPEHASH, p.to, p.validAfter));
         bytes32 structHash =
             keccak256(abi.encode(PERMIT_WITNESS_TYPEHASH, permitted, p.spender, p.nonce, p.deadline, witness));
         return keccak256(abi.encodePacked("\x19\x01", IPermit2Domain(permit2).DOMAIN_SEPARATOR(), structHash));

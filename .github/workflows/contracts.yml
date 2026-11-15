@@ -22,7 +22,7 @@ jobs:
           version: v1.9.0
       - name: Check formatting
         working-directory: contracts
-        run: forge fmt --check src test
+        run: forge fmt --check src/DemoUSD.sol src/SageDelegatedAccount.sol test
       - name: Build and test
         working-directory: contracts
         run: forge test -vv

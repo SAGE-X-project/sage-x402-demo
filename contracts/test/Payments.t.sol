@@ -2,9 +2,10 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
-import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
+import {ISignatureTransfer} from "../src/vendor/x402/interfaces/ISignatureTransfer.sol";
 import {DemoUSD} from "../src/DemoUSD.sol";
-import {X402ExactPermit2Proxy} from "../src/X402ExactPermit2Proxy.sol";
+import {x402ExactPermit2Proxy} from "../src/vendor/x402/x402ExactPermit2Proxy.sol";
+import {x402BasePermit2Proxy} from "../src/vendor/x402/x402BasePermit2Proxy.sol";
 import {SageDelegatedAccount} from "../src/SageDelegatedAccount.sol";
 
 interface IPermit2Errors {
@@ -18,16 +19,16 @@ interface IPermit2Like {
 
 contract PaymentsTest is Test {
     bytes32 private constant TOKEN_PERMISSIONS_TYPEHASH = keccak256("TokenPermissions(address token,uint256 amount)");
-    bytes32 private constant WITNESS_TYPEHASH = keccak256("Witness(address to,uint256 validAfter,bytes extra)");
+    bytes32 private constant WITNESS_TYPEHASH = keccak256("Witness(address to,uint256 validAfter)");
     bytes32 private constant PERMIT_WITNESS_TYPEHASH = keccak256(
         "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,Witness witness)"
-        "TokenPermissions(address token,uint256 amount)Witness(address to,uint256 validAfter,bytes extra)"
+        "TokenPermissions(address token,uint256 amount)Witness(address to,uint256 validAfter)"
     );
     string private constant DID = "did:sage:eip155:31337:0x2279b7a0a67db372996a5fab50d91eaa73d2ebe6:payment-agent";
 
     DemoUSD private token;
     address private permit2;
-    X402ExactPermit2Proxy private proxy;
+    x402ExactPermit2Proxy private proxy;
     SageDelegatedAccount private account;
 
     uint256 private userKey = 0xA11CE;
@@ -44,7 +45,7 @@ contract PaymentsTest is Test {
         agent = vm.addr(agentKey);
         token = new DemoUSD(address(this));
         permit2 = deployCode("Permit2.sol:Permit2");
-        proxy = new X402ExactPermit2Proxy(ISignatureTransfer(permit2));
+        proxy = new x402ExactPermit2Proxy(permit2);
         account = new SageDelegatedAccount(user, permit2, address(proxy));
         token.mint(user, 1_000e6);
         token.mint(address(account), 1_000e6);
@@ -212,7 +213,7 @@ contract PaymentsTest is Test {
                 }),
                 ISignatureTransfer.SignatureTransferDetails({to: merchant, requestedAmount: p.amount}),
                 address(account),
-                keccak256(abi.encode(WITNESS_TYPEHASH, p.to, p.validAfter, keccak256(p.extra))),
+                keccak256(abi.encode(WITNESS_TYPEHASH, p.to, p.validAfter)),
                 witnessType,
                 signature
             );
@@ -240,7 +241,7 @@ contract PaymentsTest is Test {
     function test_ModelB_RejectsFutureValidAfter() public {
         SageDelegatedAccount.PaymentAuthorization memory p = _payment(1e6, merchant, 19);
         p.validAfter = block.timestamp + 30;
-        _expectRefusal(p, agentKey, abi.encodeWithSelector(X402ExactPermit2Proxy.PaymentNotYetValid.selector));
+        _expectRefusal(p, agentKey, abi.encodeWithSelector(x402BasePermit2Proxy.PaymentTooEarly.selector));
     }
 
     function test_ModelB_MalformedSignatureIsInvalidWithoutRevert() public view {
@@ -281,14 +282,14 @@ contract PaymentsTest is Test {
         SageDelegatedAccount.PaymentAuthorization memory p = _payment(5e6, merchant, 23);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(payerKey, _permit2Digest(p));
         proxy.settleWithPermit(
-            X402ExactPermit2Proxy.EIP2612Permit({value: 5e6, deadline: block.timestamp + 60, r: pr, s: ps, v: pv}),
+            x402BasePermit2Proxy.EIP2612Permit({value: 5e6, deadline: block.timestamp + 60, r: pr, s: ps, v: pv}),
             ISignatureTransfer.PermitTransferFrom({
                 permitted: ISignatureTransfer.TokenPermissions({token: p.token, amount: p.amount}),
                 nonce: p.nonce,
                 deadline: p.deadline
             }),
             payer,
-            X402ExactPermit2Proxy.Witness({to: p.to, validAfter: p.validAfter, extra: p.extra}),
+            x402ExactPermit2Proxy.Witness({to: p.to, validAfter: p.validAfter}),
             abi.encodePacked(r, s, v)
         );
         assertEq(token.balanceOf(merchant), 5e6);
@@ -366,8 +367,7 @@ contract PaymentsTest is Test {
             nonce: nonce,
             deadline: block.timestamp + 60,
             to: to,
-            validAfter: block.timestamp - 1,
-            extra: ""
+            validAfter: block.timestamp - 1
         });
     }
 
@@ -391,7 +391,7 @@ contract PaymentsTest is Test {
 
     function _permit2Digest(SageDelegatedAccount.PaymentAuthorization memory p) private view returns (bytes32) {
         bytes32 permitted = keccak256(abi.encode(TOKEN_PERMISSIONS_TYPEHASH, p.token, p.amount));
-        bytes32 witness = keccak256(abi.encode(WITNESS_TYPEHASH, p.to, p.validAfter, keccak256(p.extra)));
+        bytes32 witness = keccak256(abi.encode(WITNESS_TYPEHASH, p.to, p.validAfter));
         return keccak256(
             abi.encodePacked(
                 "\x19\x01",
@@ -418,8 +418,8 @@ contract PaymentsTest is Test {
             nonce: p.nonce,
             deadline: p.deadline
         });
-        X402ExactPermit2Proxy.Witness memory witness =
-            X402ExactPermit2Proxy.Witness({to: p.to, validAfter: p.validAfter, extra: p.extra});
+        x402ExactPermit2Proxy.Witness memory witness =
+            x402ExactPermit2Proxy.Witness({to: p.to, validAfter: p.validAfter});
         return address(proxy).call(abi.encodeCall(proxy.settle, (permit, address(target), witness, signature)));
     }
 
