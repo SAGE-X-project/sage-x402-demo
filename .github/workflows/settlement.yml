@@ -1,0 +1,66 @@
+name: Settlement
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.11'
+      - name: Format, vet and build
+        run: |
+          test -z "$(gofmt -l cmd internal)"
+          go vet ./...
+          go build ./...
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  local-chain:
+    name: Local chain settlement
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: SAGE-X-project/sage-contracts
+          path: sage-contracts
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.11'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+        with:
+          version: v1.9.0
+      - name: Install sage-contracts dependencies
+        working-directory: sage-contracts/ethereum
+        run: npm ci --ignore-scripts
+      - name: Start the local chain
+        env:
+          SAGE_CONTRACTS_DIR: ${{ github.workspace }}/sage-contracts
+        run: scripts/local-chain.sh 8545
+      - name: Run settlement scenarios
+        run: go run ./cmd/settle-scenarios
+      - name: Keep the trace
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: settlement-trace
+          path: run/
+          if-no-files-found: warn
+          retention-days: 14
