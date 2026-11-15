@@ -25,8 +25,26 @@ Needs Foundry 1.9 (`anvil`, `cast`, `forge`), Go 1.26 and a sibling
 ```bash
 git submodule update --init --recursive
 scripts/local-chain.sh            # anvil on :8545, writes run/deployment.json
+go run ./cmd/binding-scenarios    # 8 SAGE x402 binding scenarios, trace in run/binding-trace.jsonl
 go run ./cmd/settle-scenarios     # 10 payment scenarios, trace in run/settle-trace.jsonl
 ```
+
+### SAGE x402 binding
+
+`binding-scenarios` runs a payment agent and a resource server that are both
+SAGE 0.11.0 agents registered in the chain Registry (`sage` `wire011`, keys
+read from the Registry on every message):
+
+- the 402 quote is a SAGE-signed response, so `payTo` and the amount cannot be replaced;
+- the x402 payment payload travels inside the SAGE-signed request, so it cannot be stripped, changed or moved;
+- each quote belongs to one requesting DID and can be used once;
+- the payer is bound to the requesting DID. For model B the delegated account's on-chain delegation must name that DID. For model A the payer key signs `SAGE x402 payer binding\nDID: <did>` (EIP-191): a payer address that only the DID asserts would let any agent claim someone else's account.
+
+The attacks it mounts and expects to be refused: a relay rewriting `payTo` in
+the quote, a relay changing the amount in the signed payment, another
+registered agent submitting the agent's intercepted delegated payment or
+claiming its model A account, paying one quote twice, and sending the payment
+without SAGE.
 
 `local-chain.sh` deploys the SAGE Registry, places Permit2 and the x402 exact
 proxy at the addresses the x402 Go SDK `go/v2.29.0` hard-codes, deploys the
