@@ -139,6 +139,219 @@ contract PaymentsTest is Test {
         account.delegate(agent, DID, address(token), 1_000e6, uint64(block.timestamp + 1 days), payTos);
     }
 
+    function test_ModelB_RejectsWellFormedEip3009FromAccount() public {
+        bytes32 nonce = keccak256("b-3009-wf");
+        bytes memory signature = _accountSignature(_payment(1e6, merchant, 11), agentKey);
+        vm.expectRevert(DemoUSD.InvalidAuthorizationSignature.selector);
+        token.transferWithAuthorization(
+            address(account), merchant, 1e6, block.timestamp - 1, block.timestamp + 60, nonce, signature
+        );
+    }
+
+    function test_ModelB_SignatureCannotReplayOnAnotherAccount() public {
+        SageDelegatedAccount second = new SageDelegatedAccount(user, permit2, address(proxy));
+        token.mint(address(second), 100e6);
+        address[] memory payTos = new address[](1);
+        payTos[0] = merchant;
+        vm.startPrank(user);
+        second.delegate(agent, DID, address(token), 10e6, uint64(block.timestamp + 1 days), payTos);
+        second.setBudget(address(token), 25e6);
+        vm.stopPrank();
+        SageDelegatedAccount.PaymentAuthorization memory p = _payment(4e6, merchant, 12);
+        bytes memory signature = _accountSignature(p, agentKey);
+        (bool ok,) = _callWith(account, p, signature);
+        assertTrue(ok, "first account refused");
+        (bool replayed, bytes memory reason) = _callWith(second, p, signature);
+        assertFalse(replayed, "signature replayed on another account");
+        assertEq(reason, _aclRefusal());
+        assertEq(token.balanceOf(address(second)), 100e6);
+    }
+
+    function test_ModelB_RedelegationRetiresOldSignatures() public {
+        SageDelegatedAccount.PaymentAuthorization memory p = _payment(1e6, merchant, 13);
+        bytes memory signature = _accountSignature(p, agentKey);
+        address[] memory payTos = new address[](1);
+        payTos[0] = merchant;
+        vm.startPrank(user);
+        account.revoke(agent);
+        account.delegate(agent, DID, address(token), 10e6, uint64(block.timestamp + 1 days), payTos);
+        vm.stopPrank();
+        (bool ok, bytes memory reason) = _callWith(account, p, signature);
+        assertFalse(ok, "old signature revived");
+        assertEq(reason, _aclRefusal());
+    }
+
+    function test_ModelB_RejectsDeadlineBeyondDelegation() public {
+        SageDelegatedAccount.PaymentAuthorization memory p = _payment(1e6, merchant, 14);
+        p.deadline = block.timestamp + 2 days;
+        _expectRefusal(p, agentKey, _aclRefusal());
+    }
+
+    function test_ModelB_RejectsOtherToken() public {
+        DemoUSD otherToken = new DemoUSD(address(this));
+        otherToken.mint(address(account), 100e6);
+        SageDelegatedAccount.PaymentAuthorization memory p = _payment(1e6, merchant, 15);
+        p.token = address(otherToken);
+        (bool ok, bytes memory reason) = _callWith(account, p, _accountSignature(p, agentKey));
+        assertFalse(ok, "other token accepted");
+        assertEq(reason, _aclRefusal());
+    }
+
+    function test_ModelB_RejectsDirectPermit2Spender() public {
+        SageDelegatedAccount.PaymentAuthorization memory p = _payment(1e6, merchant, 16);
+        p.spender = address(this);
+        bytes memory signature = _accountSignature(p, agentKey);
+        string memory witnessType = proxy.WITNESS_TYPE_STRING();
+        vm.expectRevert(IPermit2Errors.InvalidContractSignature.selector);
+        ISignatureTransfer(permit2)
+            .permitWitnessTransferFrom(
+                ISignatureTransfer.PermitTransferFrom({
+                    permitted: ISignatureTransfer.TokenPermissions({token: p.token, amount: p.amount}),
+                    nonce: p.nonce,
+                    deadline: p.deadline
+                }),
+                ISignatureTransfer.SignatureTransferDetails({to: merchant, requestedAmount: p.amount}),
+                address(account),
+                keccak256(abi.encode(WITNESS_TYPEHASH, p.to, p.validAfter, keccak256(p.extra))),
+                witnessType,
+                signature
+            );
+    }
+
+    function test_ModelB_RejectsHighSSignature() public {
+        SageDelegatedAccount.PaymentAuthorization memory p = _payment(1e6, merchant, 17);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(agentKey, account.agentDigest(p, agent));
+        uint256 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+        bytes memory signature = abi.encode(p, abi.encodePacked(agent, r, bytes32(n - uint256(s)), v == 27 ? 28 : 27));
+        (bool ok, bytes memory reason) = _callWith(account, p, signature);
+        assertFalse(ok, "malleable signature accepted");
+        assertEq(reason, _aclRefusal());
+    }
+
+    function test_ModelB_RejectsTamperedRecipientAtSettle() public {
+        SageDelegatedAccount.PaymentAuthorization memory p = _payment(1e6, merchant, 18);
+        bytes memory signature = _accountSignature(p, agentKey);
+        p.to = other;
+        (bool ok,) = _callWith(account, p, signature);
+        assertFalse(ok, "tampered recipient accepted");
+        assertEq(token.balanceOf(other), 0);
+    }
+
+    function test_ModelB_RejectsFutureValidAfter() public {
+        SageDelegatedAccount.PaymentAuthorization memory p = _payment(1e6, merchant, 19);
+        p.validAfter = block.timestamp + 30;
+        _expectRefusal(p, agentKey, abi.encodeWithSelector(X402ExactPermit2Proxy.PaymentNotYetValid.selector));
+    }
+
+    function test_ModelB_MalformedSignatureIsInvalidWithoutRevert() public view {
+        assertEq(account.isValidSignature(bytes32(0), hex"deadbeef"), bytes4(0xffffffff));
+        assertEq(
+            account.isValidSignature(_permit2Digest(_payment(1e6, merchant, 20)), new bytes(64)), bytes4(0xffffffff)
+        );
+    }
+
+    function test_ModelB_RefusesUnlimitedBudgetAndDuplicateRecipients() public {
+        vm.startPrank(user);
+        vm.expectRevert(SageDelegatedAccount.InvalidDelegation.selector);
+        account.setBudget(address(token), type(uint256).max);
+        address[] memory payTos = new address[](2);
+        payTos[0] = merchant;
+        payTos[1] = merchant;
+        vm.expectRevert(SageDelegatedAccount.InvalidDelegation.selector);
+        account.delegate(agent, DID, address(token), 1e6, uint64(block.timestamp + 1 days), payTos);
+        vm.stopPrank();
+    }
+
+    function test_ModelB_RedelegationDropsOldRecipients() public {
+        address[] memory payTos = new address[](1);
+        payTos[0] = other;
+        vm.prank(user);
+        account.delegate(agent, DID, address(token), 10e6, uint64(block.timestamp + 1 days), payTos);
+        _expectRefusal(_payment(1e6, merchant, 21), agentKey, _aclRefusal());
+        _settle(_payment(1e6, other, 22), agentKey);
+    }
+
+    function test_SettleWithPermitSurvivesFrontRunPermit() public {
+        // A plain EOA payer that never approved Permit2 uses the EIP-2612 extension.
+        uint256 payerKey = 0xC0FFEE;
+        address payer = vm.addr(payerKey);
+        token.mint(payer, 10e6);
+        (uint8 pv, bytes32 pr, bytes32 ps) = vm.sign(payerKey, _permit2612Digest(payer, 5e6, block.timestamp + 60));
+        token.permit(payer, permit2, 5e6, block.timestamp + 60, pv, pr, ps); // front-run by anyone
+        SageDelegatedAccount.PaymentAuthorization memory p = _payment(5e6, merchant, 23);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(payerKey, _permit2Digest(p));
+        proxy.settleWithPermit(
+            X402ExactPermit2Proxy.EIP2612Permit({value: 5e6, deadline: block.timestamp + 60, r: pr, s: ps, v: pv}),
+            ISignatureTransfer.PermitTransferFrom({
+                permitted: ISignatureTransfer.TokenPermissions({token: p.token, amount: p.amount}),
+                nonce: p.nonce,
+                deadline: p.deadline
+            }),
+            payer,
+            X402ExactPermit2Proxy.Witness({to: p.to, validAfter: p.validAfter, extra: p.extra}),
+            abi.encodePacked(r, s, v)
+        );
+        assertEq(token.balanceOf(merchant), 5e6);
+    }
+
+    function test_DemoUSD_ReceiveRequiresPayee() public {
+        bytes32 nonce = keccak256("recv");
+        bytes32 structHash = keccak256(
+            abi.encode(
+                token.RECEIVE_WITH_AUTHORIZATION_TYPEHASH(),
+                user,
+                merchant,
+                1e6,
+                block.timestamp - 1,
+                block.timestamp + 60,
+                nonce
+            )
+        );
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(userKey, keccak256(abi.encodePacked("\x19\x01", token.DOMAIN_SEPARATOR(), structHash)));
+        vm.expectRevert(DemoUSD.CallerMustBePayee.selector);
+        token.receiveWithAuthorization(
+            user, merchant, 1e6, block.timestamp - 1, block.timestamp + 60, nonce, abi.encodePacked(r, s, v)
+        );
+        vm.prank(merchant);
+        token.receiveWithAuthorization(
+            user, merchant, 1e6, block.timestamp - 1, block.timestamp + 60, nonce, abi.encodePacked(r, s, v)
+        );
+        assertEq(token.balanceOf(merchant), 1e6);
+    }
+
+    function test_DemoUSD_CanceledAuthorizationCannotBeUsed() public {
+        bytes32 nonce = keccak256("cancel");
+        (uint8 cv, bytes32 cr, bytes32 cs) = vm.sign(
+            userKey,
+            keccak256(
+                abi.encodePacked(
+                    "\x19\x01",
+                    token.DOMAIN_SEPARATOR(),
+                    keccak256(abi.encode(token.CANCEL_AUTHORIZATION_TYPEHASH(), user, nonce))
+                )
+            )
+        );
+        token.cancelAuthorization(user, nonce, abi.encodePacked(cr, cs, cv));
+        (uint8 v, bytes32 r, bytes32 s) = _sign3009(userKey, user, merchant, 1e6, nonce);
+        vm.expectRevert(DemoUSD.AuthorizationAlreadyUsed.selector);
+        token.transferWithAuthorization(user, merchant, 1e6, block.timestamp - 1, block.timestamp + 60, nonce, v, r, s);
+    }
+
+    function _permit2612Digest(address owner, uint256 value, uint256 deadline) private view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"),
+                owner,
+                permit2,
+                value,
+                token.nonces(owner),
+                deadline
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", token.DOMAIN_SEPARATOR(), structHash));
+    }
+
     // ---- helpers ----
 
     function _payment(uint256 amount, address to, uint256 nonce)
@@ -163,33 +376,51 @@ contract PaymentsTest is Test {
         view
         returns (bytes memory)
     {
+        return _signFor(account, p, key);
+    }
+
+    function _signFor(SageDelegatedAccount target, SageDelegatedAccount.PaymentAuthorization memory p, uint256 key)
+        private
+        view
+        returns (bytes memory)
+    {
+        address signer = vm.addr(key);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, target.agentDigest(p, signer));
+        return abi.encode(p, abi.encodePacked(signer, r, s, v));
+    }
+
+    function _permit2Digest(SageDelegatedAccount.PaymentAuthorization memory p) private view returns (bytes32) {
         bytes32 permitted = keccak256(abi.encode(TOKEN_PERMISSIONS_TYPEHASH, p.token, p.amount));
         bytes32 witness = keccak256(abi.encode(WITNESS_TYPEHASH, p.to, p.validAfter, keccak256(p.extra)));
-        bytes32 digest = keccak256(
+        return keccak256(
             abi.encodePacked(
                 "\x19\x01",
                 IPermit2Like(permit2).DOMAIN_SEPARATOR(),
                 keccak256(abi.encode(PERMIT_WITNESS_TYPEHASH, permitted, p.spender, p.nonce, p.deadline, witness))
             )
         );
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
-        return abi.encode(p, abi.encodePacked(r, s, v));
     }
 
     function _call(SageDelegatedAccount.PaymentAuthorization memory p, uint256 key)
         private
         returns (bool, bytes memory)
     {
-        ISignatureTransfer.PermitTransferFrom memory permit =
-            ISignatureTransfer.PermitTransferFrom({
-                permitted: ISignatureTransfer.TokenPermissions({token: p.token, amount: p.amount}),
-                nonce: p.nonce,
-                deadline: p.deadline
-            });
+        return _callWith(account, p, _accountSignature(p, key));
+    }
+
+    function _callWith(
+        SageDelegatedAccount target,
+        SageDelegatedAccount.PaymentAuthorization memory p,
+        bytes memory signature
+    ) private returns (bool, bytes memory) {
+        ISignatureTransfer.PermitTransferFrom memory permit = ISignatureTransfer.PermitTransferFrom({
+            permitted: ISignatureTransfer.TokenPermissions({token: p.token, amount: p.amount}),
+            nonce: p.nonce,
+            deadline: p.deadline
+        });
         X402ExactPermit2Proxy.Witness memory witness =
             X402ExactPermit2Proxy.Witness({to: p.to, validAfter: p.validAfter, extra: p.extra});
-        return address(proxy)
-            .call(abi.encodeCall(proxy.settle, (permit, address(account), witness, _accountSignature(p, key))));
+        return address(proxy).call(abi.encodeCall(proxy.settle, (permit, address(target), witness, signature)));
     }
 
     function _settle(SageDelegatedAccount.PaymentAuthorization memory p, uint256 key) private {

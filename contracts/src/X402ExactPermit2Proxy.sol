@@ -61,10 +61,13 @@ contract X402ExactPermit2Proxy {
         Witness calldata witness,
         bytes calldata signature
     ) external {
-        IERC20PermitLike(permit.permitted.token)
+        // Anyone may submit the same EIP-2612 permit first. A failed permit
+        // must not block settlement; Permit2 still fails if the allowance is short.
+        try IERC20PermitLike(permit.permitted.token)
             .permit(
                 owner, address(PERMIT2), permit2612.value, permit2612.deadline, permit2612.v, permit2612.r, permit2612.s
-            );
+            ) {}
+            catch {}
         _settle(permit, owner, witness, signature);
     }
 

@@ -17,8 +17,15 @@ interface IPermit2Domain {
 /// ERC-20 allowance this account gives Permit2, so the chain enforces it on
 /// every settlement. EIP-3009 and any other signature use are refused.
 ///
-/// The agent signs the Permit2 digest and sends it together with the fields of
-/// that digest, so this account can check them before accepting.
+/// The agent does not sign the bare Permit2 digest: that digest names neither
+/// this account nor the delegation, so it could be replayed against another
+/// account that delegates the same key. The agent signs agentDigest(), an
+/// EIP-712 wrapper bound to this account, the chain and the key's current
+/// delegation epoch, and sends it with the Permit2 fields so this account can
+/// check them. The signature is abi.encode(PaymentAuthorization, key || ecdsa)
+/// where key is the 20-byte payment key and ecdsa its 65-byte signature over
+/// agentDigest(). Revoking or re-delegating a key starts a new epoch, so
+/// earlier signatures stop working.
 contract SageDelegatedAccount is IERC1271 {
     using SafeERC20 for IERC20;
 
@@ -27,6 +34,7 @@ contract SageDelegatedAccount is IERC1271 {
         address token;
         uint256 perPaymentCap;
         uint64 expires;
+        uint64 epoch;
         bool active;
     }
 
@@ -44,6 +52,11 @@ contract SageDelegatedAccount is IERC1271 {
 
     bytes4 private constant MAGIC = IERC1271.isValidSignature.selector;
     bytes4 private constant INVALID = 0xffffffff;
+    uint256 public constant MAX_PAY_TOS = 16;
+    bytes32 private constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 private constant AUTHORIZATION_TYPEHASH =
+        keccak256("SagePaymentAuthorization(bytes32 permit2Digest,uint64 epoch)");
     bytes32 private constant TOKEN_PERMISSIONS_TYPEHASH = keccak256("TokenPermissions(address token,uint256 amount)");
     bytes32 private constant WITNESS_TYPEHASH = keccak256("Witness(address to,uint256 validAfter,bytes extra)");
     bytes32 private constant PERMIT_WITNESS_TYPEHASH = keccak256(
@@ -58,11 +71,18 @@ contract SageDelegatedAccount is IERC1271 {
     mapping(address key => Delegation) private _delegations;
     mapping(address key => mapping(address payTo => bool)) public allowedPayTo;
     mapping(address key => address[]) private _payTos;
+    mapping(address key => uint64) private _epochs;
 
     event Delegated(
-        address indexed key, string did, address indexed token, uint256 perPaymentCap, uint64 expires, address[] payTos
+        address indexed key,
+        string did,
+        address indexed token,
+        uint256 perPaymentCap,
+        uint64 expires,
+        uint64 epoch,
+        address[] payTos
     );
-    event DelegationRevoked(address indexed key);
+    event DelegationRevoked(address indexed key, uint64 epoch);
     event BudgetSet(address indexed token, uint256 amount);
 
     error NotOwner();
@@ -91,26 +111,29 @@ contract SageDelegatedAccount is IERC1271 {
     ) external onlyOwner {
         if (
             key == address(0) || bytes(did).length == 0 || token == address(0) || perPaymentCap == 0
-                || expires <= block.timestamp || payTos.length == 0
+                || expires <= block.timestamp || payTos.length == 0 || payTos.length > MAX_PAY_TOS
         ) revert InvalidDelegation();
         _clearPayTos(key);
         for (uint256 i; i < payTos.length; ++i) {
-            if (payTos[i] == address(0)) revert InvalidDelegation();
+            if (payTos[i] == address(0) || allowedPayTo[key][payTos[i]]) revert InvalidDelegation();
             allowedPayTo[key][payTos[i]] = true;
             _payTos[key].push(payTos[i]);
         }
-        _delegations[key] = Delegation(did, token, perPaymentCap, expires, true);
-        emit Delegated(key, did, token, perPaymentCap, expires, payTos);
+        uint64 epoch = ++_epochs[key];
+        _delegations[key] = Delegation(did, token, perPaymentCap, expires, epoch, true);
+        emit Delegated(key, did, token, perPaymentCap, expires, epoch, payTos);
     }
 
     function revoke(address key) external onlyOwner {
         _clearPayTos(key);
         delete _delegations[key];
-        emit DelegationRevoked(key);
+        emit DelegationRevoked(key, ++_epochs[key]);
     }
 
     /// Sets the total amount all delegates together may still spend in token.
+    /// An unlimited allowance never decreases, so it is refused.
     function setBudget(address token, uint256 amount) external onlyOwner {
+        if (amount == type(uint256).max) revert InvalidDelegation();
         IERC20(token).forceApprove(permit2, amount);
         emit BudgetSet(token, amount);
     }
@@ -123,18 +146,65 @@ contract SageDelegatedAccount is IERC1271 {
         return (_delegations[key], _payTos[key]);
     }
 
+    /// The digest a delegated key signs for one payment from this account.
+    function agentDigest(PaymentAuthorization calldata payment, address key) external view returns (bytes32) {
+        return _agentDigest(_digest(payment), _delegations[key].epoch);
+    }
+
+    /// Decodes the signature format; external so a malformed input can be caught.
+    function decodeAuthorization(bytes calldata signature)
+        external
+        pure
+        returns (PaymentAuthorization memory, bytes memory)
+    {
+        return abi.decode(signature, (PaymentAuthorization, bytes));
+    }
+
     function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-        if (signature.length < 64) return INVALID;
-        (PaymentAuthorization memory payment, bytes memory agentSignature) =
-            abi.decode(signature, (PaymentAuthorization, bytes));
+        PaymentAuthorization memory payment;
+        bytes memory agentSignature;
+        try this.decodeAuthorization(signature) returns (PaymentAuthorization memory p, bytes memory sig) {
+            (payment, agentSignature) = (p, sig);
+        } catch {
+            return INVALID;
+        }
         if (_digest(payment) != hash) return INVALID;
-        (address key, ECDSA.RecoverError error,) = ECDSA.tryRecover(hash, agentSignature);
-        if (error != ECDSA.RecoverError.NoError) return INVALID;
+        // The agent signature names its key so the account can pick that key's
+        // epoch before recovering; recovery must then return the same key.
+        return _authorized(payment, hash, agentSignature) ? MAGIC : INVALID;
+    }
+
+    function _authorized(PaymentAuthorization memory payment, bytes32 permit2Digest, bytes memory agentSignature)
+        private
+        view
+        returns (bool)
+    {
+        if (agentSignature.length != 85) return false;
+        // Signature layout: 20-byte key address followed by the 65-byte ECDSA signature.
+        address key;
+        assembly ("memory-safe") {
+            key := shr(96, mload(add(agentSignature, 32)))
+        }
+        bytes memory ecdsaSignature = new bytes(65);
+        for (uint256 i; i < 65; ++i) {
+            ecdsaSignature[i] = agentSignature[i + 20];
+        }
         Delegation storage d = _delegations[key];
-        bool allowed = d.active && block.timestamp < d.expires && payment.deadline <= d.expires
-            && payment.spender == proxy && payment.token == d.token && payment.amount <= d.perPaymentCap
-            && allowedPayTo[key][payment.to];
-        return allowed ? MAGIC : INVALID;
+        if (!d.active) return false;
+        (address signer, ECDSA.RecoverError error,) =
+            ECDSA.tryRecover(_agentDigest(permit2Digest, d.epoch), ecdsaSignature);
+        return error == ECDSA.RecoverError.NoError && signer == key && block.timestamp < d.expires
+            && payment.deadline <= d.expires && payment.spender == proxy && payment.token == d.token
+            && payment.amount <= d.perPaymentCap && allowedPayTo[key][payment.to];
+    }
+
+    function _agentDigest(bytes32 permit2Digest, uint64 epoch) private view returns (bytes32) {
+        bytes32 domain = keccak256(
+            abi.encode(DOMAIN_TYPEHASH, keccak256("SageDelegatedAccount"), keccak256("1"), block.chainid, address(this))
+        );
+        return keccak256(
+            abi.encodePacked("\x19\x01", domain, keccak256(abi.encode(AUTHORIZATION_TYPEHASH, permit2Digest, epoch)))
+        );
     }
 
     function _digest(PaymentAuthorization memory p) private view returns (bytes32) {
