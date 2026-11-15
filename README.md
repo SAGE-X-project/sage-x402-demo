@@ -17,6 +17,25 @@ repository only adds what the payment demo needs.
 
 Nothing here holds real value. Keys are public Anvil test accounts.
 
+## Run locally
+
+Needs Foundry 1.9 (`anvil`, `cast`, `forge`), Go 1.26 and a sibling
+`sage-contracts` checkout with `npm ci` done in `ethereum/`.
+
+```bash
+git submodule update --init --recursive
+scripts/local-chain.sh            # anvil on :8545, writes run/deployment.json
+go run ./cmd/settle-scenarios     # 10 payment scenarios, trace in run/settle-trace.jsonl
+```
+
+`local-chain.sh` deploys the SAGE Registry, places Permit2 and the x402 exact
+proxy at the addresses the x402 Go SDK `go/v2.29.0` hard-codes, deploys the
+demo token and a delegated account, and funds both models.
+`settle-scenarios` pays with the SDK client and settles with the SDK
+facilitator. For refused model B payments it also asks the account and the
+token why, because the facilitator reports every Permit2 refusal as a failed
+simulation.
+
 ## Status
 
 Under construction. See the SAGE work checklist for the plan.
