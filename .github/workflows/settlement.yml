@@ -48,7 +48,7 @@ jobs:
         with:
           version: v1.9.0
       - name: Install sage-contracts dependencies
-        working-directory: sage-contracts/ethereum
+        working-directory: sage-contracts/v4/ethereum
         run: npm ci --ignore-scripts
       - name: Start the local chain
         env:
