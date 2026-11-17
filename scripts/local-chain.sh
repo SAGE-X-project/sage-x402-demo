@@ -72,14 +72,14 @@ send --private-key "$DEPLOYER_KEY" "$TOKEN" 'mint(address,uint256)' "$USER" 1000
 
 # The Registry deploys with the same deployer, so its address is deterministic
 # only on a fresh chain; the record below is the source of truth.
-(cd "$SAGE_CONTRACTS_DIR/ethereum" &&
+(cd "$SAGE_CONTRACTS_DIR/v4/ethereum" &&
   { [ -f component-tests/chain-registry/evidence/soljson.cjs ] || python3 component-tests/chain-registry/prepare.py; } &&
   node scripts/deploy-chain-registry.mjs --rpc "$RPC" --network anvil --out "$RUN/registry.json") >/dev/null
 # Register three SAGE agents and leave them active. sig-3 of key base B is the
 # public recipe B+3 (sage-contracts component-test fixtures). Anvil reports a
 # block final 64 blocks later, so mine past that before anything reads them.
 for spec in payment-agent:100 resource-server:200 attacker-agent:300; do
-  (cd "$SAGE_CONTRACTS_DIR/ethereum" && node scripts/registry-lifecycle-scenarios.mjs --rpc "$RPC" \
+  (cd "$SAGE_CONTRACTS_DIR/v4/ethereum" && node scripts/registry-lifecycle-scenarios.mjs --rpc "$RPC" \
     --deployment "$RUN/registry.json" --out "$RUN/registry-${spec%%:*}.json" --agent "${spec%%:*}" \
     --keep-active --key-index-base "${spec##*:}") >/dev/null
 done
